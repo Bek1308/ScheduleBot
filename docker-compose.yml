@@ -1,0 +1,6 @@
+services:
+  smartschedulebot:
+    image: ${DOCKER_REGISTRY-}smartschedulebot
+    build:
+      context: .
+      dockerfile: SmartScheduleBot\Dockerfile
