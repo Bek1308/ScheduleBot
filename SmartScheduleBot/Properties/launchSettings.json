@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "SmartScheduleBot": {
+      "commandName": "Project"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}

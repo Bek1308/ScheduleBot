@@ -7,160 +7,135 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Telegram.Bot;
-using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using ClosedXML.Excel;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 
 class Program
 {
     private static TelegramBotClient botClient;
-    private static TelegramBotClient targetBotClient; // Бошқа бот учун клиент
-    private static string targetBotToken = "7373851133:AAEpEm7hSnv1HEYoSJEZjXksBOUe6_guaZk"; // Бошқа бот токени (ўзгартиринг)
-    private static long targetChatId = 6010438305; // Маълумот юбориладиган чат ID (ўзгартиринг)
-    private static string baseUrl = "https://smartschedule-k0ex.onrender.com"; // Ngrok URL
+    private static TelegramBotClient targetBotClient;
+    private static string targetBotToken = "7373851133:AAEpEm7hSnv1HEYoSJEZjXksBOUe6_guaZk";
+    private static long targetChatId = 6010438305;
+    private static string baseUrl = "https://smartschedule-k0ex.onrender.com";
     private static string selectedFaculty = "";
     private static string selectedCourse = "";
     private static string selectedGroup = "";
     private static string selectedTeacherCode = null;
-    private static bool isTeacherMode = false; // Муаллим режими фаоллигини кузатиш учун
+    private static bool isTeacherMode = false;
     private static readonly Dictionary<long, bool> awaitingAdminCode = new Dictionary<long, bool>();
-    private static readonly HashSet<long> uniqueUsers = new HashSet<long>(); // Умумий фойдаланувчилар
-    private static readonly Dictionary<long, DateTime> activeUsers = new Dictionary<long, DateTime>(); // Фаол фойдаланувчилар
-    private static Timer statsTimer; // Динамик янгилаш учун таймер
-    private static int statsMessageId = 0; // Янгиланиши керак бўлган хабар ID си
+    private static readonly HashSet<long> uniqueUsers = new HashSet<long>();
+    private static readonly Dictionary<long, DateTime> activeUsers = new Dictionary<long, DateTime>();
+    private static int statsMessageId = 0;
 
-    private static async Task Main()
+    public static async Task Main(string[] args)
     {
-        botClient = new TelegramBotClient("7355644988:AAEyex_eompvTQ6ju_gx0cR9dmOonraBRRE"); // Бот токенингиз
-        targetBotClient = new TelegramBotClient(targetBotToken); // Бошқа ботга уланиш
+        // Bot tokenini environment variable’dan olish
+        var botToken = Environment.GetEnvironmentVariable("BOT_TOKEN") ?? "7355644988:AAEyex_eompvTQ6ju_gx0cR9dmOonraBRRE";
+        botClient = new TelegramBotClient(botToken);
+        targetBotClient = new TelegramBotClient(targetBotToken);
 
         var me = await botClient.GetMeAsync();
         Console.WriteLine($"✅ Бот {me.FirstName} ба кор андохта шуд.");
 
-        // Бошланғич хабарни юбориш ва MessageId ни сақлаш
+        // Webhook sozlash
+        var webhookUrl = $"{Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL") ?? "https://your-app-name.onrender.com"}/webhook";
+        await botClient.SetWebhookAsync(webhookUrl);
+        Console.WriteLine($"Webhook set to: {webhookUrl}");
+
+        // Boshlang‘ich statistika xabarini yuborish
         await SendInitialStatsMessage();
 
-        // Таймерни 5 дақиқада бир ишга тушириш (300000 миллисония)
-        statsTimer = new Timer(UpdateStatsMessage, null, 0, 300);
+        // HTTP serverni ishga tushirish
+        var builder = WebApplication.CreateBuilder(args);
+        var app = builder.Build();
 
-        botClient.StartReceiving(HandleUpdateAsync, HandleErrorAsync);
-        Console.ReadLine();
+        // Webhook endpoint
+        app.MapPost("/webhook", async (HttpContext context) =>
+        {
+            try
+            {
+                var body = await new StreamReader(context.Request.Body).ReadToEndAsync();
+                var update = JsonSerializer.Deserialize<Update>(body);
+                await HandleUpdateAsync(botClient, update, CancellationToken.None);
+                return Results.Ok();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Webhook xatoligi: {ex.Message}");
+                return Results.StatusCode(500);
+            }
+        });
+
+        // Root sahifa (Render uchun)
+        app.MapGet("/", () => "Bot is running on Render!");
+
+        // Statistika yangilash (har 30 sekundda)
+        _ = Task.Run(async () =>
+        {
+            while (true)
+            {
+                await UpdateStatsMessage();
+                await Task.Delay(30000); // 30 sekund
+            }
+        });
+
+        var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+        app.Run($"http://0.0.0.0:{port}");
     }
 
     private static async Task SendInitialStatsMessage()
     {
         try
         {
-            int totalUsers = uniqueUsers.Count; // Умумий фойдаланувчилар сони
-            int activeUsersCount = activeUsers.Count(u => (DateTime.Now - u.Value).TotalMinutes <= 5); // Сўнгги 5 дақиқада фаол
-
+            int totalUsers = uniqueUsers.Count;
+            int activeUsersCount = activeUsers.Count(u => (DateTime.Now - u.Value).TotalMinutes <= 5);
             string statsMessage = $"📊 Статистикаи корбарон:\n" +
                                  $"Шумораи умумии корбарон: {totalUsers}\n" +
                                  $"Корабарони фаол дар айни замон: {activeUsersCount}";
 
             var sentMessage = await targetBotClient.SendTextMessageAsync(targetChatId, statsMessage);
-            statsMessageId = sentMessage.MessageId; // Хабар ID сини сақлаш
-            Console.WriteLine($"📤 Бошланғич статистика юборди: {statsMessage}, MessageId: {statsMessageId}");
+            statsMessageId = sentMessage.MessageId;
+            Console.WriteLine("✅ Boshlang‘ich statistika xabari yuborildi.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"❌ Бошланғич статистика юборишда хатогӣ: {ex.Message}");
+            Console.WriteLine($"❌ Хатогӣ (SendInitialStatsMessage): {ex.Message}");
         }
     }
 
-    private static async void UpdateStatsMessage(object state)
+    private static async Task UpdateStatsMessage()
     {
         try
         {
-            int totalUsers = uniqueUsers.Count; // Умумий фойдаланувчилар сони
-            int activeUsersCount = activeUsers.Count(u => (DateTime.Now - u.Value).TotalMinutes <= 5); // Сўнгги 5 дақиқада фаол
-
+            int totalUsers = uniqueUsers.Count;
+            int activeUsersCount = activeUsers.Count(u => (DateTime.Now - u.Value).TotalMinutes <= 5);
             string statsMessage = $"📊 Статистикаи корбарон:\n" +
                                  $"Шумораи умумии корбарон: {totalUsers}\n" +
                                  $"Корабарони фаол дар айни замон: {activeUsersCount}";
 
-            await targetBotClient.EditMessageTextAsync(
-                chatId: targetChatId,
-                messageId: statsMessageId,
-                text: statsMessage
-            );
-            Console.WriteLine($"📤 Статистика янгиланди: {statsMessage}");
+            await targetBotClient.EditMessageTextAsync(targetChatId, statsMessageId, statsMessage);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"❌ Статистика янгилашда хатогӣ: {ex.Message}");
+            if (ex.Message.Contains("message is not modified")) return; // Agar xabar o‘zgarmasa, e’tibor bermaslik
+            Console.WriteLine($"❌ Хатогӣ (UpdateStatsMessage): {ex.Message}");
         }
-    }
-
-    private static Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
-    {
-        Console.WriteLine($"❌ Хатогӣ рух дод: {exception.Message}");
-        return Task.CompletedTask;
-    }
-                                         
-    private static async Task<bool> IsUserSubscribed(long userId)
-    {
-        try
-        {
-            var chatMember = await botClient.GetChatMemberAsync("@Career1ink", userId);
-            return chatMember.Status is ChatMemberStatus.Member or ChatMemberStatus.Administrator or ChatMemberStatus.Creator;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"❌ Санҷиши обуна бо хатогӣ рӯ ба рӯ шуд: {ex.Message}");
-            return false;
-        }
-    }
-
-    private static async Task SendWelcomeMessage(long chatId)
-    {
-        string welcomeMessage =
-            "🎉 Хуш омадед ба *SmartScheduleBot*! Ман ба шумо дар ёфтани осон ва зуд жадвали дарсӣ кӯмак мерасонам.\n\n" +
-            "📚 *Имкониятҳои ман:*\n" +
-            "- Барои донишҷӯён жадвали дарсӣ аз рӯи факулта, курс ва гурӯҳ.\n" +
-            "- Барои муаллимон жадвали дарсӣ тавассути коди махсус.\n" +
-            "- Жадвали дақиқ барои ҳар рӯз ва дидани жадвали пурра тавассути тугмаи веб.\n\n" +
-            "🔧 *Фармонҳои мавҷуд:*\n" +
-            "/start - Оғози дубораи бот\n" +
-            "/help - Кӯмак ва иттилоот\n" +
-            "/admin - Боргирии рӯйхати муаллимон барои админҳо\n\n" +
-            "📩 *Барои пешниҳод ва талабҳо:* Ба @future1308 нависед!";
-
-        await botClient.SendTextMessageAsync(chatId, welcomeMessage, parseMode: ParseMode.Markdown);
-        Console.WriteLine($"📩 Ба корбар {chatId} паёми хуш омадед фиристода шуд.");
-    }
-
-    private static async Task SendHelpMessage(long chatId)
-    {
-        string helpMessage =
-            "ℹ️ *Ёрдамчии SmartScheduleBot*\n\n" +
-            "Ман ба шумо дар ёфтани жадвали дарсӣ осон кӯмак мерасонам:\n" +
-            "1. Агар донишҷӯ бошед: Факулта, курс ва гурӯҳатонро интихоб кунед.\n" +
-            "2. Агар муаллим бошед: Коди махсусатонро ворид кунед.\n" +
-            "3. Барои жадвали рӯзона рӯзро интихоб кунед ё тавассути тугмаи *Пурра* жадвали комилро бинед.\n\n" +
-            "🔧 *Фармонҳо:*\n" +
-            "/start - Оғоз\n" +
-            "/help - Ин кӯмак\n" +
-            "/admin - Рӯйхати муаллимон (фақат барои админҳо)\n\n" +
-            "📩 Агар савол ё пешниҳод дошта бошед, ба @future1308 муроҷиат кунед!";
-
-        await botClient.SendTextMessageAsync(chatId, helpMessage, parseMode: ParseMode.Markdown);
-        Console.WriteLine($"📩 Ба корбар {chatId} паёми кӯмак фиристода шуд.");
     }
 
     private static async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        if (update.Type == UpdateType.Message && update.Message.Text != null)
+        if (update.Type == UpdateType.Message && update.Message?.Text != null)
         {
             long chatId = update.Message.Chat.Id;
             long userId = update.Message.From.Id;
             string messageText = update.Message.Text;
 
-            // Фойдаланувчини рўйхатга қўшиш
-            uniqueUsers.Add(userId); // Умумий фойдаланувчиларга қўшиш
-            activeUsers[userId] = DateTime.Now; // Фаоллик вақтини янгилаш
+            uniqueUsers.Add(userId);
+            activeUsers[userId] = DateTime.Now;
 
             if (awaitingAdminCode.ContainsKey(chatId) && awaitingAdminCode[chatId])
             {
@@ -228,22 +203,66 @@ class Program
                             "❌ Фармони номаълум! Барои дидани фармонҳои мавҷуд /help-ро пахш кунед.");
                         Console.WriteLine($"📩 Корбар {userId} фармони нодуруст фиристод: {messageText}");
                     }
-                    else
-                    {
-                        await botClient.SendTextMessageAsync(chatId,
-                            "❌ Паёми нодуруст! Лутфан аз фармонҳои мавҷуд истифода кунед (/help).");
-                        Console.WriteLine($"📩 Корбар {userId} паёми бегона фиристод: {messageText}");
-                    }
                     break;
             }
         }
         else if (update.Type == UpdateType.CallbackQuery)
         {
             long userId = update.CallbackQuery.From.Id;
-            uniqueUsers.Add(userId); // Callback орқали ҳам қўшиш
-            activeUsers[userId] = DateTime.Now; // Фаоллик вақтини янгилаш
+            uniqueUsers.Add(userId);
+            activeUsers[userId] = DateTime.Now;
             await HandleCallbackQuery(update.CallbackQuery);
         }
+    }
+
+    private static async Task<bool> IsUserSubscribed(long userId)
+    {
+        try
+        {
+            var chatMember = await botClient.GetChatMemberAsync("@Career1ink", userId);
+            return chatMember.Status is ChatMemberStatus.Member or ChatMemberStatus.Administrator or ChatMemberStatus.Creator;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Санҷиши обуна бо хатогӣ рӯ ба рӯ шуд: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static async Task SendWelcomeMessage(long chatId)
+    {
+        string welcomeMessage =
+            "🎉 Хуш омадед ба *SmartScheduleBot*! Ман ба шумо дар ёфтани осон ва зуд жадвали дарсӣ кӯмак мерасонам.\n\n" +
+            "📚 *Имкониятҳои ман:*\n" +
+            "- Барои донишҷӯён жадвали дарсӣ аз рӯи факулта, курс ва гурӯҳ.\n" +
+            "- Барои муаллимон жадвали дарсӣ тавассути коди махсус.\n" +
+            "- Жадвали дақиқ барои ҳар рӯз ва дидани жадвали пурра тавассути тугмаи веб.\n\n" +
+            "🔧 *Фармонҳои мавҷуд:*\n" +
+            "/start - Оғози дубораи бот\n" +
+            "/help - Кӯмак ва иттилоот\n" +
+            "/admin - Боргирии рӯйхати муаллимон барои админҳо\n\n" +
+            "📩 *Барои пешниҳод ва талабҳо:* Ба @future1308 нависед!";
+
+        await botClient.SendTextMessageAsync(chatId, welcomeMessage, parseMode: ParseMode.Markdown);
+        Console.WriteLine($"📩 Ба корбар {chatId} паёми хуш омадед фиристода шуд.");
+    }
+
+    private static async Task SendHelpMessage(long chatId)
+    {
+        string helpMessage =
+            "ℹ️ *Ёрдамчии SmartScheduleBot*\n\n" +
+            "Ман ба шумо дар ёфтани жадвали дарсӣ осон кӯмак мерасонам:\n" +
+            "1. Агар донишҷӯ бошед: Факулта, курс ва гурӯҳатонро интихоб кунед.\n" +
+            "2. Агар муаллим бошед: Коди махсусатонро ворид кунед.\n" +
+            "3. Барои жадвали рӯзона рӯзро интихоб кунед ё тавассути тугмаи *Пурра* жадвали комилро бинед.\n\n" +
+            "🔧 *Фармонҳо:*\n" +
+            "/start - Оғоз\n" +
+            "/help - Ин кӯмак\n" +
+            "/admin - Рӯйхати муаллимон (фақат барои админҳо)\n\n" +
+            "📩 Агар савол ё пешниҳод дошта бошед, ба @future1308 муроҷиат кунед!";
+
+        await botClient.SendTextMessageAsync(chatId, helpMessage, parseMode: ParseMode.Markdown);
+        Console.WriteLine($"📩 Ба корбар {chatId} паёми кӯмак фиристода шуд.");
     }
 
     private static async Task SendUserTypeSelection(long chatId)
@@ -378,8 +397,8 @@ class Program
                 WebApp = new WebAppInfo { Url = webAppUrl }
             };
             await botClient.SetChatMenuButtonAsync(chatId: chatId, menuButton: newMenuButton);
-            Console.WriteLine($"🔄 Тугмаи Web App барои {chatId} нав карда шуд: {webAppUrl}");
             await botClient.SendTextMessageAsync(chatId, "📅 Барои дидани жадвали пурра тугмаи *Пурра*-ро пахш кунед!");
+            Console.WriteLine($"🔄 Тугмаи Web App барои {chatId} нав карда шуд: {webAppUrl}");
         }
         catch (Exception ex)
         {
@@ -398,7 +417,7 @@ class Program
         {
             ResizeKeyboard = true
         };
-        string message = isTeacher ? "📌 Лутфан рӯзи дилхоҳро интихоб кунед:" : "📌 Лутфан рӯзи дилхоҳро интихоб кунед:";
+        string message = "📌 Лутфан рӯзи дилхоҳро интихоб кунед:";
         await botClient.SendTextMessageAsync(chatId, message, replyMarkup: keyboard);
         Console.WriteLine($"📅 Ба корбар {chatId} саволи интихоби рӯз фиристода шуд (муаллим: {isTeacher}).");
     }
