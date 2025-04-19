@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -7,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
@@ -28,56 +30,60 @@ class Program
     private static TelegramBotClient targetBotClient;
     private static string targetBotToken = "6384809941:AAHmFKJe6963lifn0etUHbpyGsodO7Olzyg";
     private static long targetChatId = 6010438305;
-    private static string baseUrl = "https://smartschedule-k0ex.onrender.com"; // Backend API manzili
-    private static readonly Dictionary<long, UserState> userStates = new Dictionary<long, UserState>();
-    private static readonly Dictionary<long, bool> awaitingAdminCode = new Dictionary<long, bool>();
-    private static readonly HashSet<long> uniqueUsers = new HashSet<long>();
-    private static readonly Dictionary<long, DateTime> activeUsers = new Dictionary<long, DateTime>();
-    private static readonly Dictionary<long, string> userUsernames = new Dictionary<long, string>(); // Username larni saqlash
+    private static string baseUrl = "https://smartschedule-k0ex.onrender.com";
+    private static readonly ConcurrentDictionary<long, UserState> userStates = new ConcurrentDictionary<long, UserState>();
+    private static readonly ConcurrentDictionary<long, bool> awaitingAdminCode = new ConcurrentDictionary<long, bool>();
+    private static readonly ConcurrentDictionary<long, bool> uniqueUsers = new ConcurrentDictionary<long, bool>();
+    private static readonly ConcurrentDictionary<long, DateTime> activeUsers = new ConcurrentDictionary<long, DateTime>();
+    private static readonly ConcurrentDictionary<long, string> userUsernames = new ConcurrentDictionary<long, string>();
     private static int statsMessageId = 0;
-    private static readonly string dataFilePath = "user_data.txt"; // Ma’lumotlarni saqlash uchun text fayl
+    private static readonly string dataFilePath = "user_data.txt";
+    private static readonly object fileLock = new object();
 
     // Fayldan ma’lumotlarni yuklash
     private static void LoadUserData()
     {
         try
         {
-            if (File.Exists(dataFilePath))
+            lock (fileLock)
             {
-                var lines = File.ReadAllLines(dataFilePath);
-                bool readingUniqueUsers = false;
-                bool readingUserUsernames = false;
-
-                foreach (var line in lines)
+                if (File.Exists(dataFilePath))
                 {
-                    if (line.Trim() == "uniqueUsers:")
-                    {
-                        readingUniqueUsers = true;
-                        readingUserUsernames = false;
-                        continue;
-                    }
-                    else if (line.Trim() == "userUsernames:")
-                    {
-                        readingUniqueUsers = false;
-                        readingUserUsernames = true;
-                        continue;
-                    }
+                    var lines = File.ReadAllLines(dataFilePath);
+                    bool readingUniqueUsers = false;
+                    bool readingUserUsernames = false;
 
-                    if (readingUniqueUsers && long.TryParse(line.Trim(), out long userId))
+                    foreach (var line in lines)
                     {
-                        uniqueUsers.Add(userId);
-                    }
-                    else if (readingUserUsernames)
-                    {
-                        var parts = line.Split(':');
-                        if (parts.Length >= 2 && long.TryParse(parts[0].Trim(), out long id))
+                        if (line.Trim() == "uniqueUsers:")
                         {
-                            string username = string.Join(":", parts[1..]).Trim();
-                            userUsernames[id] = username;
+                            readingUniqueUsers = true;
+                            readingUserUsernames = false;
+                            continue;
+                        }
+                        else if (line.Trim() == "userUsernames:")
+                        {
+                            readingUniqueUsers = false;
+                            readingUserUsernames = true;
+                            continue;
+                        }
+
+                        if (readingUniqueUsers && long.TryParse(line.Trim(), out long userId))
+                        {
+                            uniqueUsers.TryAdd(userId, true);
+                        }
+                        else if (readingUserUsernames)
+                        {
+                            var parts = line.Split(':');
+                            if (parts.Length >= 2 && long.TryParse(parts[0].Trim(), out long id))
+                            {
+                                string username = string.Join(":", parts[1..]).Trim();
+                                userUsernames.TryAdd(id, username);
+                            }
                         }
                     }
+                    Console.WriteLine("✅ Fayldan foydalanuvchi ma’lumotlari yuklandi.");
                 }
-                Console.WriteLine("✅ Fayldan foydalanuvchi ma’lumotlari yuklandi.");
             }
         }
         catch (Exception ex)
@@ -91,20 +97,23 @@ class Program
     {
         try
         {
-            using (var writer = new StreamWriter(dataFilePath))
+            lock (fileLock)
             {
-                writer.WriteLine("uniqueUsers:");
-                foreach (var userId in uniqueUsers)
+                using (var writer = new StreamWriter(dataFilePath))
                 {
-                    writer.WriteLine(userId);
+                    writer.WriteLine("uniqueUsers:");
+                    foreach (var userId in uniqueUsers.Keys)
+                    {
+                        writer.WriteLine(userId);
+                    }
+                    writer.WriteLine("userUsernames:");
+                    foreach (var kvp in userUsernames)
+                    {
+                        writer.WriteLine($"{kvp.Key}:{kvp.Value}");
+                    }
                 }
-                writer.WriteLine("userUsernames:");
-                foreach (var kvp in userUsernames)
-                {
-                    writer.WriteLine($"{kvp.Key}:{kvp.Value}");
-                }
+                Console.WriteLine("✅ Foydalanuvchi ma’lumotlari faylga saqlandi.");
             }
-            Console.WriteLine("✅ Foydalanuvchi ma’lumotlari faylga saqlandi.");
         }
         catch (Exception ex)
         {
@@ -118,47 +127,53 @@ class Program
         botClient = new TelegramBotClient(botToken);
         targetBotClient = new TelegramBotClient(targetBotToken);
 
-        // Fayldan ma’lumotlarni yuklash
         LoadUserData();
 
         var me = await botClient.GetMeAsync();
         Console.WriteLine($"✅ Бот {me.FirstName} ба кор андохта шуд.");
 
-        // Webhook o'rniga polling ishlatiladi
-        await botClient.DeleteWebhookAsync(); // Agar oldin webhook o'rnatilgan bo'lsa, o'chirish
+        await botClient.DeleteWebhookAsync();
         int offset = 0;
 
-        // Boshlang'ich statistika xabarini yuborish
         await SendInitialStatsMessage();
 
-        // Statistikani yangilash uchun alohida vazifa
         _ = Task.Run(async () =>
         {
             while (true)
             {
-                await UpdateStatsMessage();
-                SaveUserData(); // Har 30 sekundda ma’lumotlarni saqlash
+                try
+                {
+                    await UpdateStatsMessage();
+                    SaveUserData();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"❌ Statistikani yangilashda xato: {ex.Message}");
+                }
                 await Task.Delay(30000);
             }
         });
 
-        // Polling tsikli
         while (true)
         {
             try
             {
-                var updates = await botClient.GetUpdatesAsync(offset);
+                var updates = await botClient.GetUpdatesAsync(offset, timeout: 30);
                 foreach (var update in updates)
                 {
-                    await HandleUpdateAsync(botClient, update, CancellationToken.None);
+                    _ = Task.Run(() => HandleUpdateAsync(botClient, update, CancellationToken.None));
                     offset = update.Id + 1;
                 }
+            }
+            catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+            {
+                Console.WriteLine($"❌ Forbidden xatosi pollingda: {ex.Message}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"❌ Polling xatoligi: {ex.Message}");
+                await Task.Delay(5000);
             }
-            await Task.Delay(1000); // Har sekundda yangilanishlarni tekshirish
         }
     }
 
@@ -176,6 +191,10 @@ class Program
             var sentMessage = await targetBotClient.SendTextMessageAsync(targetChatId, statsMessage);
             statsMessageId = sentMessage.MessageId;
             Console.WriteLine("✅ Boshlang‘ich statistika xabari yuborildi.");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendInitialStatsMessage): {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -196,6 +215,10 @@ class Program
 
             await targetBotClient.EditMessageTextAsync(targetChatId, statsMessageId, statsMessage);
         }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (UpdateStatsMessage): {ex.Message}");
+        }
         catch (Exception ex)
         {
             if (ex.Message.Contains("message is not modified")) return;
@@ -203,7 +226,6 @@ class Program
         }
     }
 
-    // Faol foydalanuvchilar ro‘yxatini username bilan qaytaradi
     private static string GetActiveUsersList()
     {
         string result = "";
@@ -211,7 +233,7 @@ class Program
         {
             if ((DateTime.Now - user.Value).TotalMinutes <= 5)
             {
-                string username = userUsernames.ContainsKey(user.Key) ? userUsernames[user.Key] : "Noma’lum";
+                string username = userUsernames.GetValueOrDefault(user.Key, "Noma’lum");
                 result += $"ID: {user.Key}, Username: {username}\n";
             }
         }
@@ -220,96 +242,105 @@ class Program
 
     private static async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        if (update.Type == UpdateType.Message && update.Message?.Text != null)
+        try
         {
-            long chatId = update.Message.Chat.Id;
-            long userId = update.Message.From.Id;
-            string messageText = update.Message.Text;
-
-            uniqueUsers.Add(userId);
-            activeUsers[userId] = DateTime.Now;
-            userUsernames[userId] = update.Message.From.Username ?? $"{update.Message.From.FirstName} {update.Message.From.LastName}".Trim();
-
-            if (!userStates.ContainsKey(chatId))
-                userStates[chatId] = new UserState();
-
-            if (awaitingAdminCode.ContainsKey(chatId) && awaitingAdminCode[chatId])
+            if (update.Type == UpdateType.Message && update.Message?.Text != null)
             {
-                if (messageText == "13082003")
-                {
-                    awaitingAdminCode[chatId] = false;
-                    Console.WriteLine($"📩 Корбар {userId} коди дурусти админро ворид кард.");
-                    await ExportTeachersList(chatId);
-                }
-                else
-                {
-                    awaitingAdminCode[chatId] = false;
-                    await botClient.SendTextMessageAsync(chatId, "❌ Код нодуруст аст! Лутфан дубора бо фармони /admin ворид кунед.");
-                }
-                return;
-            }
+                long chatId = update.Message.Chat.Id;
+                long userId = update.Message.From.Id;
+                string messageText = update.Message.Text;
 
-            switch (messageText)
-            {
-                case "/start":
-                    Console.WriteLine($"📩 Корбар {userId} фармони /start-ро фиристод.");
-                    awaitingAdminCode[chatId] = false;
-                    await botClient.SetChatMenuButtonAsync(chatId, new MenuButtonDefault());
-                    bool isSubscribed = await IsUserSubscribed(userId);
-                    if (isSubscribed)
+                uniqueUsers.TryAdd(userId, true);
+                activeUsers.AddOrUpdate(userId, DateTime.Now, (k, v) => DateTime.Now);
+                userUsernames.AddOrUpdate(userId, update.Message.From.Username ?? $"{update.Message.From.FirstName} {update.Message.From.LastName}".Trim(), (k, v) => v);
+
+                var state = userStates.GetOrAdd(chatId, _ => new UserState());
+
+                if (awaitingAdminCode.GetValueOrDefault(chatId, false))
+                {
+                    if (messageText == "13082003")
                     {
-                        userStates[chatId] = new UserState();
-                        await SendWelcomeMessage(chatId);
-                        await SendUserTypeSelection(chatId);
+                        awaitingAdminCode.TryRemove(chatId, out _);
+                        Console.WriteLine($"📩 Корбар {userId} коди дурусти админро ворид кард.");
+                        await ExportTeachersList(chatId);
                     }
                     else
                     {
-                        await SendSubscriptionPrompt(chatId);
+                        awaitingAdminCode.TryRemove(chatId, out _);
+                        await botClient.SendTextMessageAsync(chatId, "❌ Код нодуруст аст! Лутфан дубора бо фармони /admin ворид кунед.");
                     }
-                    break;
+                    return;
+                }
 
-                case "/help":
-                    Console.WriteLine($"📩 Корбар {userId} фармони /help-ро фиристод.");
-                    await SendHelpMessage(chatId);
-                    break;
+                switch (messageText)
+                {
+                    case "/start":
+                        Console.WriteLine($"📩 Корбар {userId} фармони /start-ро фиристод.");
+                        awaitingAdminCode.TryRemove(chatId, out _);
+                        await botClient.SetChatMenuButtonAsync(chatId, new MenuButtonDefault());
+                        bool isSubscribed = await IsUserSubscribed(userId);
+                        if (isSubscribed)
+                        {
+                            userStates.AddOrUpdate(chatId, new UserState(), (k, v) => new UserState());
+                            await SendWelcomeMessage(chatId);
+                            await SendUserTypeSelection(chatId);
+                        }
+                        else
+                        {
+                            await SendSubscriptionPrompt(chatId);
+                        }
+                        break;
 
-                case "/admin":
-                    awaitingAdminCode[chatId] = true;
-                    await botClient.SendTextMessageAsync(chatId, "🔑 Лутфан коди админро ворид кунед:");
-                    Console.WriteLine($"📩 Корбар {userId} фармони /admin-ро фиристод.");
-                    break;
+                    case "/help":
+                        Console.WriteLine($"📩 Корбар {userId} фармони /help-ро фиристод.");
+                        await SendHelpMessage(chatId);
+                        break;
 
-                default:
-                    if (userStates[chatId].IsTeacherMode && userStates[chatId].SelectedTeacherCode == null && !messageText.StartsWith("/"))
-                    {
-                        await HandleTeacherCodeInput(chatId, messageText);
-                    }
-                    else if (userStates[chatId].IsTeacherMode && userStates[chatId].SelectedTeacherCode != null && !messageText.StartsWith("/"))
-                    {
-                        await HandleDaySelection(chatId, messageText);
-                    }
-                    else if (!userStates[chatId].IsTeacherMode && !messageText.StartsWith("/"))
-                    {
-                        await HandleDaySelection(chatId, messageText);
-                    }
-                    else if (messageText.StartsWith("/"))
-                    {
-                        await botClient.SendTextMessageAsync(chatId,
-                            "❌ Фармони номаълум! Барои дидани фармонҳои мавҷуд /help-ро пахш кунед.");
-                        Console.WriteLine($"📩 Корбар {userId} фармони нодуруст фиристод: {messageText}");
-                    }
-                    break;
+                    case "/admin":
+                        awaitingAdminCode.AddOrUpdate(chatId, true, (k, v) => true);
+                        await botClient.SendTextMessageAsync(chatId, "🔑 Лутфан коди админро ворид кунед:");
+                        Console.WriteLine($"📩 Корбар {userId} фармони /admin-ро фиристод.");
+                        break;
+
+                    default:
+                        if (state.IsTeacherMode && state.SelectedTeacherCode == null && !messageText.StartsWith("/"))
+                        {
+                            await HandleTeacherCodeInput(chatId, messageText);
+                        }
+                        else if (state.IsTeacherMode && state.SelectedTeacherCode != null && !messageText.StartsWith("/"))
+                        {
+                            await HandleDaySelection(chatId, messageText);
+                        }
+                        else if (!state.IsTeacherMode && !messageText.StartsWith("/"))
+                        {
+                            await HandleDaySelection(chatId, messageText);
+                        }
+                        else if (messageText.StartsWith("/"))
+                        {
+                            await botClient.SendTextMessageAsync(chatId,
+                                "❌ Фармони номаълум! Барои дидани фармонҳои мавҷуд /help-ро пахш кунед.");
+                            Console.WriteLine($"📩 Корбар {userId} фармони нодуруст фиристод: {messageText}");
+                        }
+                        break;
+                }
+            }
+            else if (update.Type == UpdateType.CallbackQuery)
+            {
+                long userId = update.CallbackQuery.From.Id;
+                uniqueUsers.TryAdd(userId, true);
+                activeUsers.AddOrUpdate(userId, DateTime.Now, (k, v) => DateTime.Now);
+                userUsernames.AddOrUpdate(userId, update.CallbackQuery.From.Username ?? $"{update.CallbackQuery.From.FirstName} {update.CallbackQuery.From.LastName}".Trim(), (k, v) => v);
+                userStates.GetOrAdd(update.CallbackQuery.Message.Chat.Id, _ => new UserState());
+                await HandleCallbackQuery(update.CallbackQuery);
             }
         }
-        else if (update.Type == UpdateType.CallbackQuery)
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
         {
-            long userId = update.CallbackQuery.From.Id;
-            uniqueUsers.Add(userId);
-            activeUsers[userId] = DateTime.Now;
-            userUsernames[userId] = update.CallbackQuery.From.Username ?? $"{update.CallbackQuery.From.FirstName} {update.CallbackQuery.From.LastName}".Trim();
-            if (!userStates.ContainsKey(update.CallbackQuery.Message.Chat.Id))
-                userStates[update.CallbackQuery.Message.Chat.Id] = new UserState();
-            await HandleCallbackQuery(update.CallbackQuery);
+            Console.WriteLine($"❌ Forbidden xatosi foydalanuvchi {update.Message?.From?.Id}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ HandleUpdateAsync xatosi: {ex.Message}");
         }
     }
 
@@ -319,6 +350,11 @@ class Program
         {
             var chatMember = await botClient.GetChatMemberAsync("@Career1ink", userId);
             return chatMember.Status is ChatMemberStatus.Member or ChatMemberStatus.Administrator or ChatMemberStatus.Creator;
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (IsUserSubscribed) foydalanuvchi {userId}: {ex.Message}");
+            return false;
         }
         catch (Exception ex)
         {
@@ -330,19 +366,30 @@ class Program
     private static async Task SendWelcomeMessage(long chatId)
     {
         string welcomeMessage =
-            "🎉 Хуш омадед ба *SmartScheduleBot*! Ман ба шумо дар ёфтани осон ва зуд жадвали дарсī кӯмак мерасонам.\n\n" +
-            "📚 *Имкониятҳои ман:*\n" +
-            "- Барои донишҷӯён жадвали дарсī аз рӯи факулта, курс ва гурӯҳ.\n" +
-            "- Барои муаллимон жадвали дарсī тавассути коди махсус.\n" +
-            "- Жадвали дақиқ барои ҳар рӯз ва дидани жадвали пурра тавассути тугмаи веб.\n\n" +
-            "🔧 *Фармонҳои мавҷуд:*\n" +
-            "/start - Оғози дубораи бот\n" +
-            "/help - Кӯмак ва иттилоот\n" +
-            "/admin - Боргирии рӯйхати муаллимон барои админҳо\n\n" +
-            "📩 *Барои пешниҳод ва талабҳо:* Ба @future1308 нависед!";
+                   "🎉 Хуш омадед ба *SmartScheduleBot*! Ман ба шумо дар ёфтани осон ва зуд жадвали дарсī кӯмак мерасонам.\n\n" +
+                   "📚 *Имкониятҳои ман:*\n" +
+                   "- Барои донишҷӯён жадвали дарсī аз рӯи факулта, курс ва гурӯҳ.\n" +
+                   "- Барои муаллимон жадвали дарс тавассути коди махсус.\n" +
+                   "- Жадвали дақиқ барои ҳар рӯз ва дидани жадвали пурра тавассути тугмаи веб.\n\n" +
+                   "🔧 *Фармонҳои мавҷуд:*\n" +
+                   "/start - Оғози дубораи бот\n" +
+                   "/help - Кӯмак ва иттилоот\n" +
+                   "/admin - Боргирии рӯйхати муаллимон барои админҳо\n\n" +
+                   "📩 *Барои пешниҳод ва талабҳо:* Ба @future1308 нависед!";
 
-        await botClient.SendTextMessageAsync(chatId, welcomeMessage, parseMode: ParseMode.Markdown);
-        Console.WriteLine($"📩 Ба корбар {chatId} паёми хуш омадед фиристода шуд.");
+        try
+        {
+            await botClient.SendTextMessageAsync(chatId, welcomeMessage, parseMode: ParseMode.Markdown);
+            Console.WriteLine($"📩 Ба корбар {chatId} паёми хуш омадед фиристода шуд.");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendWelcomeMessage) foydalanuvchi {chatId}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Хатогӣ (SendWelcomeMessage): {ex.Message}");
+        }
     }
 
     private static async Task SendHelpMessage(long chatId)
@@ -359,8 +406,19 @@ class Program
             "/admin - Рӯйхати муаллимон (фақат барои админҳо)\n\n" +
             "📩 Агар савол ё пешниҳод дошта бошед, ба @future1308 муроҷиат кунед!";
 
-        await botClient.SendTextMessageAsync(chatId, helpMessage, parseMode: ParseMode.Markdown);
-        Console.WriteLine($"📩 Ба корбар {chatId} паёми кӯмак фиристода шуд.");
+        try
+        {
+            await botClient.SendTextMessageAsync(chatId, helpMessage, parseMode: ParseMode.Markdown);
+            Console.WriteLine($"📩 Ба корбар {chatId} паёми кӯмак фиристода шуд.");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendHelpMessage) foydalanuvchi {chatId}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Хатогӣ (SendHelpMessage): {ex.Message}");
+        }
     }
 
     private static async Task SendUserTypeSelection(long chatId)
@@ -370,8 +428,20 @@ class Program
             new[] { InlineKeyboardButton.WithCallbackData("👨‍🎓 Донишҷӯ", "student") },
             new[] { InlineKeyboardButton.WithCallbackData("👨‍🏫 Муаллим", "teacher") }
         });
-        await botClient.SendTextMessageAsync(chatId, "📌 Ба кадом сифат идома додан мехоҳед?", replyMarkup: inlineKeyboard);
-        Console.WriteLine($"📩 Ба корбар {chatId} савол оиди интихоби сифат фиристода шуд.");
+
+        try
+        {
+            await botClient.SendTextMessageAsync(chatId, "📌 Ба кадом сифат идома додан мехоҳед?", replyMarkup: inlineKeyboard);
+            Console.WriteLine($"📩 Ба корбар {chatId} савол оиди интихоби сифат фиристода шуд.");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendUserTypeSelection) foydalanuvchi {chatId}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Хатогӣ (SendUserTypeSelection): {ex.Message}");
+        }
     }
 
     private static async Task SendSubscriptionPrompt(long chatId)
@@ -381,8 +451,20 @@ class Program
             new[] { InlineKeyboardButton.WithUrl("📢 Ба канал обуна шавед", "https://t.me/Career1ink") },
             new[] { InlineKeyboardButton.WithCallbackData("✅ Обунаро санҷед", "check_subscription") }
         });
-        await botClient.SendTextMessageAsync(chatId, "❌ Лутфан аввал ба канал обуна шавед, баъд аз бот истифода баред:", replyMarkup: inlineKeyboard);
-        Console.WriteLine($"📢 Ба корбар {chatId} саволи обунашавī фиристода шуд.");
+
+        try
+        {
+            await botClient.SendTextMessageAsync(chatId, "❌ Лутфан аввал ба канал обуна шавед, баъд аз бот истифода баред:", replyMarkup: inlineKeyboard);
+            Console.WriteLine($"📢 Ба корбар {chatId} саволи обунашавī фиристода шуд.");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendSubscriptionPrompt) foydalanuvchi {chatId}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Хатогӣ (SendSubscriptionPrompt): {ex.Message}");
+        }
     }
 
     private static async Task SendFaculties(long chatId)
@@ -403,6 +485,10 @@ class Program
             var keyboard = new InlineKeyboardMarkup(buttons);
             await botClient.SendTextMessageAsync(chatId, "🏫 Факултаро интихоб кунед:", replyMarkup: keyboard);
             Console.WriteLine($"📋 Ба корбар {chatId} рӯйхати факултаҳо фиристода шуд.");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendFaculties) foydalanuvchi {chatId}: {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -431,6 +517,10 @@ class Program
             await botClient.SendTextMessageAsync(chatId, $"📚 {faculty} - Курсро интихоб кунед:", replyMarkup: keyboard);
             Console.WriteLine($"📋 Курсҳои факултаи {faculty} ба корбар {chatId} фиристода шуд.");
         }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendCourses) foydalanuvchi {chatId}: {ex.Message}");
+        }
         catch (Exception ex)
         {
             await botClient.SendTextMessageAsync(chatId, $"❌ Хатогī: {ex.Message}");
@@ -458,6 +548,10 @@ class Program
             await botClient.SendTextMessageAsync(chatId, $"📄 {faculty} - {course} - Гурӯҳро интихоб кунед:", replyMarkup: keyboard);
             Console.WriteLine($"📋 Гурӯҳҳои {faculty}/{course} ба корбар {chatId} фиристода шуд.");
         }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (SendGroups) foydalanuvchi {chatId}: {ex.Message}");
+        }
         catch (Exception ex)
         {
             await botClient.SendTextMessageAsync(chatId, $"❌ Хатогī: {ex.Message}");
@@ -477,6 +571,10 @@ class Program
             };
             await botClient.SetChatMenuButtonAsync(chatId: chatId, menuButton: newMenuButton);
             Console.WriteLine($"🔄 Тугмаи Web App барои {chatId} нав карда шуд: {webAppUrl}");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (UpdateMenuButton) foydalanuvchi {chatId}: {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -498,6 +596,10 @@ class Program
             await botClient.SendTextMessageAsync(chatId, "📅 Барои дидани жадвали пурра тугмаи *Пурра*-ро пахш кунед!");
             Console.WriteLine($"🔄 Тугмаи Web App барои {chatId} нав карда шуд: {webAppUrl}");
         }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (UpdateTeacherMenuButton) foydalanuvchi {chatId}: {ex.Message}");
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"❌ Дар нав кардани тугмаи Web App хатогī: {ex.Message}");
@@ -516,16 +618,25 @@ class Program
             ResizeKeyboard = true
         };
         string message = "📌 Лутфан рӯзи дилхоҳро интихоб кунед:";
-        await botClient.SendTextMessageAsync(chatId, message, replyMarkup: keyboard);
-        Console.WriteLine($"📅 Ба корбар {chatId} саволи интихоби рӯз фиристода шуд (муаллим: {isTeacher}).");
+
+        try
+        {
+            await botClient.SendTextMessageAsync(chatId, message, replyMarkup: keyboard);
+            Console.WriteLine($"📅 Ба корбар {chatId} саволи интихоби рӯз фиристода шуд (муаллим: {isTeacher}).");
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (AskForDaySelection) foydalanuvchi {chatId}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Хатогī (AskForDaySelection): {ex.Message}");
+        }
     }
 
     private static async Task HandleDaySelection(long chatId, string selectedDay)
     {
-        if (!userStates.ContainsKey(chatId))
-            userStates[chatId] = new UserState();
-
-        var state = userStates[chatId];
+        var state = userStates.GetOrAdd(chatId, _ => new UserState());
 
         string dayToFetch = selectedDay switch
         {
@@ -550,8 +661,19 @@ class Program
         {
             if (string.IsNullOrEmpty(state.SelectedFaculty) || string.IsNullOrEmpty(state.SelectedCourse) || string.IsNullOrEmpty(state.SelectedGroup))
             {
-                await botClient.SendTextMessageAsync(chatId, "❌ Лутфан аввал факулта, курс ва гурӯҳро интихоб кунед!"); //-----------------------------------------------------------------------------------------
-                await SendUserTypeSelection(chatId);
+                try
+                {
+                    await botClient.SendTextMessageAsync(chatId, "❌ Лутфан аввал факулта, курс ва гурӯҳро интихоб кунед!");
+                    await SendUserTypeSelection(chatId);
+                }
+                catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+                {
+                    Console.WriteLine($"❌ Forbidden xatosi (HandleDaySelection) foydalanuvchi {chatId}: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"❌ Хатогī (HandleDaySelection): {ex.Message}");
+                }
                 return;
             }
             webAppUrl = $"{baseUrl}/get_day/{state.SelectedFaculty}/{state.SelectedCourse}/{state.SelectedGroup}?day={Uri.EscapeDataString(dayToFetch)}";
@@ -582,6 +704,10 @@ class Program
                 }
             }
         }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (HandleDaySelection) foydalanuvchi {chatId}: {ex.Message}");
+        }
         catch (Exception ex)
         {
             await botClient.SendTextMessageAsync(chatId, $"❌ Хатогī: {ex.Message}");
@@ -591,10 +717,7 @@ class Program
 
     private static async Task HandleTeacherCodeInput(long chatId, string code)
     {
-        if (!userStates.ContainsKey(chatId))
-            userStates[chatId] = new UserState();
-
-        var state = userStates[chatId];
+        var state = userStates.GetOrAdd(chatId, _ => new UserState());
 
         try
         {
@@ -616,6 +739,10 @@ class Program
             {
                 await botClient.SendTextMessageAsync(chatId, "❌ Код нодуруст аст! Лутфан дубора код ворид кунед.");
             }
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (HandleTeacherCodeInput) foydalanuvchi {chatId}: {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -655,6 +782,10 @@ class Program
             }
             Console.WriteLine($"✅ Ба корбар {chatId} рӯйхати муаллимон фиристода шуд.");
         }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (ExportTeachersList) foydalanuvchi {chatId}: {ex.Message}");
+        }
         catch (Exception ex)
         {
             await botClient.SendTextMessageAsync(chatId, $"❌ Хатогī: {ex.Message}");
@@ -669,12 +800,21 @@ class Program
         string data = callbackQuery.Data;
         Console.WriteLine($"📩 Callback қабул шуд: {data}");
 
-        if (!userStates.ContainsKey(chatId))
-            userStates[chatId] = new UserState();
+        var state = userStates.GetOrAdd(chatId, _ => new UserState());
 
-        var state = userStates[chatId];
-
-        await botClient.DeleteMessageAsync(chatId, messageId);
+        try
+        {
+            await botClient.DeleteMessageAsync(chatId, messageId);
+        }
+        catch (ApiRequestException ex) when (ex.Message.Contains("Forbidden"))
+        {
+            Console.WriteLine($"❌ Forbidden xatosi (HandleCallbackQuery) foydalanuvchi {chatId}: {ex.Message}");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Хатогӣ (HandleCallbackQuery): {ex.Message}");
+        }
 
         if (data == "check_subscription")
         {
