@@ -28,7 +28,7 @@ class Program
 {
     private static TelegramBotClient botClient;
     private static TelegramBotClient targetBotClient;
-    private static string targetBotToken = "6384809941:AAHmFKJe6963lifn0etUHbpyGsodO7Olzyg";
+    private static string targetBotToken = "TargetBotToken";
     private static long targetChatId = 6010438305;
     private static string baseUrl = "https://smartschedule-k0ex.onrender.com";
     private static readonly ConcurrentDictionary<long, UserState> userStates = new ConcurrentDictionary<long, UserState>();
@@ -123,7 +123,7 @@ class Program
 
     public static async Task Main(string[] args)
     {
-        var botToken = Environment.GetEnvironmentVariable("BOT_TOKEN") ?? "7355644988:AAEyex_eompvTQ6ju_gx0cR9dmOonraBRRE";
+        var botToken = Environment.GetEnvironmentVariable("BOT_TOKEN") ?? "Token";
         botClient = new TelegramBotClient(botToken);
         targetBotClient = new TelegramBotClient(targetBotToken);
 
